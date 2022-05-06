@@ -68,6 +68,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <limits.h>
+#include "crypt.h"
 
 // C++ includes
 #include <cstddef>
@@ -922,45 +923,60 @@ static void sfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 }
 
 
-static void do_read(fuse_req_t req, size_t size, off_t off, fuse_file_info *fi) {
-
-    fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
-    buf.buf[0].flags = static_cast<fuse_buf_flags>(
-        FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
-    buf.buf[0].fd = fi->fh;
-    buf.buf[0].pos = off;
-
-    fuse_reply_data(req, &buf, FUSE_BUF_COPY_FLAGS);
-}
-
-static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
+static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t buf_size, off_t off,
                      fuse_file_info *fi) {
     (void) ino;
-    do_read(req, size, off, fi);
+    // assume requested size always > filesize
+    char *data = new (nothrow) char[buf_size];
+    if (data == 0) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    auto ciphertext_len = pread(fi->fh, data, buf_size, off);
+    if (ciphertext_len == -1) {
+        fuse_reply_err(req, errno);
+        free(data);
+        return;
+    }
+    auto plaintext_len = decrypt(data, ciphertext_len);
+    if (plaintext_len < 0) {
+        fuse_reply_err(req, -plaintext_len);
+        free(data);
+        return;
+    }
+    fuse_reply_buf(req, data, plaintext_len);
+    free(data);
 }
 
 
-static void do_write_buf(fuse_req_t req, size_t size, off_t off,
-                         fuse_bufvec *in_buf, fuse_file_info *fi) {
-    fuse_bufvec out_buf = FUSE_BUFVEC_INIT(size);
-    out_buf.buf[0].flags = static_cast<fuse_buf_flags>(
-        FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
-    out_buf.buf[0].fd = fi->fh;
-    out_buf.buf[0].pos = off;
-
-    auto res = fuse_buf_copy(&out_buf, in_buf, FUSE_BUF_COPY_FLAGS);
-    if (res < 0)
-        fuse_reply_err(req, -res);
-    else
-        fuse_reply_write(req, (size_t)res);
-}
-
-
-static void sfs_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
+static void sfs_write(fuse_req_t req, fuse_ino_t ino, const char *data, size_t data_len,
                           off_t off, fuse_file_info *fi) {
     (void) ino;
-    auto size {fuse_buf_size(in_buf)};
-    do_write_buf(req, size, off, in_buf, fi);
+    // assume that buf contains the whole file
+    char *ciphertext = new (nothrow) char[data_len + 32];
+    if (ciphertext == 0) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    auto ciphertext_len = encrypt(ciphertext, data_len + 32, data, data_len);
+    if (ciphertext_len < 0) {
+        fuse_reply_err(req, -ciphertext_len);
+        free(ciphertext);
+        return;
+    }
+    auto res = pwrite(fi->fh, ciphertext, ciphertext_len, off);
+    if (res != ciphertext_len) {
+        if (res != -1) {
+            res = pwrite(fi->fh, ciphertext + res, ciphertext_len - res, off + res);
+        }
+        if (res == -1) { // should always be true
+            fuse_reply_err(req, errno);
+            free(ciphertext);
+            return;
+        }
+    }
+    free(ciphertext);
+    fuse_reply_write(req, data_len);
 }
 
 
@@ -1141,7 +1157,7 @@ static void assign_operations(fuse_lowlevel_ops &sfs_oper) {
     sfs_oper.flush = sfs_flush;
     sfs_oper.fsync = sfs_fsync;
     sfs_oper.read = sfs_read;
-    sfs_oper.write_buf = sfs_write_buf;
+    sfs_oper.write = sfs_write;
     sfs_oper.statfs = sfs_statfs;
 #ifdef HAVE_POSIX_FALLOCATE
     sfs_oper.fallocate = sfs_fallocate;
