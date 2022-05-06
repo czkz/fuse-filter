@@ -958,7 +958,8 @@ static void sfs_write(fuse_req_t req, fuse_ino_t ino, const char *data, size_t d
         fuse_reply_err(req, ENOMEM);
         return;
     }
-    auto ciphertext_len = encrypt(ciphertext, data_len + 32, data, data_len);
+    memcpy(ciphertext, data, data_len);
+    auto ciphertext_len = encrypt(ciphertext, data_len + 32, data_len);
     if (ciphertext_len < 0) {
         fuse_reply_err(req, -ciphertext_len);
         free(ciphertext);
